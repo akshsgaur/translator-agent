@@ -9,6 +9,7 @@ This reduces latency from ~45s to ~15s per message.
 
 import os
 import json
+import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import logging
@@ -199,6 +200,67 @@ class LangChainTutorService:
             logger.error(f"  Routing error: {e}")
             return {"tool": "chat", "args": {}}
 
+    def _detect_message_language(self, text: str) -> str:
+        """
+        Lightweight language hint detector for the user's latest message.
+        Returns one of: "English", "Spanish", or "Unknown".
+        """
+        if not text:
+            return "Unknown"
+
+        lowered = text.lower()
+
+        # Strong Spanish signals first.
+        if "¿" in text or "¡" in text:
+            return "Spanish"
+        if re.search(r"[áéíóúñ]", lowered):
+            return "Spanish"
+
+        # Token-level scoring for both languages.
+        tokens = re.findall(r"[a-z']+", lowered)
+        if not tokens:
+            return "Unknown"
+
+        spanish_words = {
+            "hola", "gracias", "como", "cómo", "que", "qué", "por", "favor", "estas", "estás",
+            "nombre", "aprender", "espanol", "español", "quiero", "puedo", "mi"
+        }
+        english_words = {
+            "the", "and", "what", "how", "please", "thanks", "about", "progress", "tell",
+            "me", "let", "lets", "begin", "training", "sound", "good", "learned", "now"
+        }
+
+        spanish_score = sum(1 for token in tokens if token in spanish_words)
+        english_score = sum(1 for token in tokens if token in english_words)
+
+        if spanish_score > english_score and spanish_score > 0:
+            return "Spanish"
+        if english_score > spanish_score and english_score > 0:
+            return "English"
+
+        # ASCII-only ambiguous short messages are typically English in this app.
+        if text.isascii():
+            return "English"
+        return "Unknown"
+
+    def _is_progress_query(self, text: str) -> bool:
+        """Detect whether the user is asking for a progress summary."""
+        lowered = (text or "").lower()
+        progress_markers = [
+            "progress", "what have we learned", "what all have we learnt",
+            "what have i learned", "what did we learn", "summary", "so far"
+        ]
+        return any(marker in lowered for marker in progress_markers)
+
+    def _translate_to_language(self, text: str, target_language: str) -> str:
+        """Translate text to target language using translation model as a fallback guard."""
+        prompt = (
+            f"Translate the following text to {target_language}. "
+            f"Return only the translated text:\n\n{text}"
+        )
+        response = self.translation_llm.invoke([HumanMessage(content=prompt)])
+        return response.content.strip()
+
     def _execute_and_respond(self, tool: str, args: Dict, user_message: str,
                               memories: List[str], user_profile: Dict,
                               conversation_history: List[Dict]) -> str:
@@ -211,6 +273,8 @@ class LangChainTutorService:
 
         user_name = user_profile.get("user_name", "Student") if user_profile else "Student"
         target_lang = user_profile.get("target_language", "Spanish") if user_profile else "Spanish"
+        reply_language = self._detect_message_language(user_message)
+        logger.info(f"  Reply language hint from latest message: {reply_language}")
 
         # Build context
         memory_str = ""
@@ -258,6 +322,13 @@ class LangChainTutorService:
 
 {memory_str}
 
+Language rules (strict):
+- Reply in the SAME language as the student's latest message.
+- Do NOT switch to {target_lang} unless the student explicitly asks you to.
+- If the student writes in English, reply in English.
+- Ignore previous assistant-message language in the conversation history when choosing reply language.
+- Required reply language for this turn: {reply_language}.
+
 Be warm, encouraging, and practical. Keep responses concise but helpful."""
 
         # Build task-specific prompt
@@ -285,7 +356,22 @@ Keep it concise and engaging."""
 - Be encouraging"""
 
         else:  # chat
-            task = f"""Student says: "{user_message}"
+            if self._is_progress_query(user_message):
+                task = f"""Student asks for learning progress: "{user_message}"
+
+{conv_str}
+
+Evidence you are allowed to use:
+- Relevant memories listed in system prompt
+- Conversation lines shown above
+
+Rules for this response:
+- ONLY mention facts explicitly present in that evidence.
+- Do NOT invent vocabulary, grammar topics, or milestones.
+- If evidence is sparse, say exactly what is known and what is unknown.
+- End with one concrete next step."""
+            else:
+                task = f"""Student says: "{user_message}"
 
 {conv_str}
 
@@ -293,14 +379,25 @@ Respond naturally as their tutor. Be friendly and helpful."""
 
         try:
             logger.info(f"  [{self.reasoning_model}] Generating response...")
-            logger.info(f"  System prompt: {system_prompt[:200]}...")
-            logger.info(f"  User task: {task[:200]}...")
+            logger.info(f"  System prompt (full):\n{system_prompt}")
+            logger.info(f"  User task (full):\n{task}")
             response = self.reasoning_llm.invoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=task)
             ])
-            logger.info(f"  Raw response: {response.content[:200]}...")
-            return response.content.strip()
+            raw_response = response.content.strip()
+            logger.info(f"  Raw response (full):\n{raw_response}")
+
+            # Hard guard: if latest user message is clearly English but model replies in Spanish,
+            # rewrite to English before returning.
+            if reply_language == "English":
+                detected_response_language = self._detect_message_language(raw_response[:120])
+                if detected_response_language == "Spanish":
+                    logger.info("  Language guard triggered: rewriting Spanish response to English")
+                    raw_response = self._translate_to_language(raw_response, "English")
+                    logger.info(f"  Rewritten response (full):\n{raw_response}")
+
+            return raw_response
         except Exception as e:
             return f"Sorry, I encountered an error: {e}"
 

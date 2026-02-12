@@ -1313,7 +1313,7 @@ class TutorApp(ctk.CTk):
                     logger.info("=" * 60)
                     logger.info("STEP 6: Received response from LangChain")
                     logger.info(f"  Response length: {len(response)} chars")
-                    logger.info(f"  Response preview: {response[:200]}...")
+                    logger.info(f"  Response (full):\n{response}")
                     logger.info("=" * 60)
                 else:
                     response = f"Sorry, I encountered an error: {result.get('error', 'Unknown error')}"
@@ -1352,8 +1352,7 @@ class TutorApp(ctk.CTk):
                     user_name = self.user_profile.get("user_name", "Student") if self.user_profile else "Student"
                     target_lang = self.user_profile.get("target_language", "Spanish") if self.user_profile else "Spanish"
                     messages = [
-                        {"role": "user", "content": f"{user_name} (learning {target_lang}) said: {self._pending_user_message}"},
-                        {"role": "assistant", "content": f"Tutor responded: {response}"}
+                        {"role": "user", "content": f"{user_name} (learning {target_lang}) said: {self._pending_user_message}"}
                     ]
                     self.mem0.add(messages, user_id=self.user_id)
                     logger.info("  [Async] Mem0 storage complete")
